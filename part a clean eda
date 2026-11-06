@@ -1,0 +1,116 @@
+import os
+import pandas as pd
+import numpy as np
+from src.shipment_prep import clean_shipments, build_features, PROMISED_HOURS, FEATURES
+
+os.makedirs("data", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
+
+raw = pd.read_csv("data/raw_shipments.csv")
+hubs = pd.read_csv("data/hubs.csv")
+
+raw_rows = len(raw)
+dedup = raw.drop_duplicates()
+duplicate_rows_removed = raw_rows - len(dedup)
+rows_after_dedup = len(dedup)
+
+missing_distance_km_before = dedup["distance_km"].isna().sum()
+sentinel_weight_rows = (dedup["parcel_weight_kg"] == 999.0).sum()
+missing_parcel_weight_before = dedup["parcel_weight_kg"].isna().sum()
+missing_declared_value_before = dedup["declared_value"].isna().sum()
+missing_payment_mode_before = dedup["payment_mode"].isna().sum()
+service_type_spellings_before = dedup["service_type"].nunique()
+
+clean_df, medians = clean_shipments(raw, medians=None)
+service_type_spellings_after = clean_df["service_type"].nunique()
+
+feat = build_features(clean_df, hubs)
+feat["promised_hours"] = feat["service_type"].map(PROMISED_HOURS)
+feat["is_delayed"] = (feat["delivery_hours"] > feat["promised_hours"]).astype(int)
+
+feat.to_csv("data/modelling_table.csv", index=False)
+
+rows_after_hub_merge = len(feat)
+cols_check = FEATURES + ["delivery_hours", "is_delayed"]
+nulls_in_features_and_target = int(feat[cols_check].isna().sum().sum())
+
+declared_value_mean_inr = feat["declared_value_inr"].mean()
+declared_value_median_inr = feat["declared_value_inr"].median()
+log_declared_value_mean = feat["log_declared_value"].mean()
+log_declared_value_median = feat["log_declared_value"].median()
+
+delayed_count = int(feat["is_delayed"].sum())
+delay_rate = delayed_count / len(feat)
+
+q1 = feat["delivery_hours"].quantile(0.25)
+q3 = feat["delivery_hours"].quantile(0.75)
+iqr = q3 - q1
+lower = q1 - 1.5*iqr
+upper = q3 + 1.5*iqr
+hours_outlier_count = int(((feat["delivery_hours"] < lower) | (feat["delivery_hours"] > upper)).sum())
+
+checks = [
+    ("raw_rows", raw_rows),
+    ("duplicate_rows_removed", duplicate_rows_removed),
+    ("rows_after_dedup", rows_after_dedup),
+    ("missing_distance_km_before", int(missing_distance_km_before)),
+    ("missing_parcel_weight_before", int(missing_parcel_weight_before)),
+    ("sentinel_weight_rows", int(sentinel_weight_rows)),
+    ("missing_declared_value_before", int(missing_declared_value_before)),
+    ("missing_payment_mode_before", int(missing_payment_mode_before)),
+    ("service_type_spellings_before", int(service_type_spellings_before)),
+    ("service_type_spellings_after", int(service_type_spellings_after)),
+    ("median_distance_km", round(medians["distance_km"],4)),
+    ("median_parcel_weight_kg", round(medians["parcel_weight_kg"],4)),
+    ("median_declared_value_inr", round(medians["declared_value_inr"],4)),
+    ("rows_after_hub_merge", rows_after_hub_merge),
+    ("nulls_in_features_and_target", nulls_in_features_and_target),
+    ("delayed_count", delayed_count),
+    ("delay_rate", round(delay_rate,4)),
+    ("hours_q1", round(float(q1),4)),
+    ("hours_q3", round(float(q3),4)),
+    ("hours_lower_bound", round(float(lower),4)),
+    ("hours_upper_bound", round(float(upper),4)),
+    ("hours_outlier_count", hours_outlier_count),
+    ("declared_value_mean_inr", round(float(declared_value_mean_inr),4)),
+    ("declared_value_median_inr", round(float(declared_value_median_inr),4)),
+    ("log_declared_value_mean", round(float(log_declared_value_mean),4)),
+    ("log_declared_value_median", round(float(log_declared_value_median),4)),
+]
+
+pd.DataFrame(checks, columns=["metric","value"]).to_csv("outputs/part_a_checks.csv", index=False)
+
+def group_stats(df, dimension, group_col, bins=None, labels=None):
+    if bins is not None:
+        df = df.copy()
+        df[dimension] = pd.cut(df[group_col], bins=bins, labels=labels, right=True, include_lowest=True)
+        gcol = dimension
+    else:
+        gcol = group_col
+    agg = df.groupby(gcol, observed=True).agg(
+        shipments=("shipment_id","count"),
+        delayed=("is_delayed","sum"),
+        mean_hours=("delivery_hours","mean")
+    ).reset_index()
+    agg["dimension"] = dimension
+    agg = agg.rename(columns={gcol:"group"})
+    agg["delay_rate"] = agg["delayed"] / agg["shipments"]
+    return agg[["dimension","group","shipments","delayed","delay_rate","mean_hours"]]
+
+service_df = group_stats(feat, "service_type", "service_type")
+tier_df = group_stats(feat, "hub_tier", "hub_tier")
+bins = [0,200,400,600,2000]
+labels = ["0-200","201-400","401-600","601+"]
+dist_df = group_stats(feat, "distance_band", "distance_km", bins=bins, labels=labels)
+
+combined = pd.concat([service_df, tier_df, dist_df], ignore_index=True)
+combined["delay_rate"] = combined["delay_rate"].round(4)
+combined["mean_hours"] = combined["mean_hours"].round(4)
+combined.to_csv("outputs/part_a_delay_by_group.csv", index=False)
+
+numeric_df = feat.select_dtypes(include=[np.number])
+corr = numeric_df.corr()
+corr = corr.reset_index().rename(columns={"index":"column"})
+corr.to_csv("outputs/part_a_correlations.csv", index=False)
+print("Part A done")
+
