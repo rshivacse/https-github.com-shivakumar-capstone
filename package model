@@ -1,0 +1,82 @@
+import os, ast
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.ensemble import RandomForestClassifier
+
+os.makedirs("models", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
+
+df = pd.read_csv("data/modelling_table.csv")
+from src.shipment_prep import FEATURES
+
+X = df[FEATURES]
+y = df["is_delayed"]
+
+# read final config
+config = pd.read_csv("outputs/part_c_final_config.csv").iloc[0]
+selector_k = int(config["selector_k"])
+n_estimators = int(config["n_estimators"])
+max_depth_raw = config["max_depth"]
+if isinstance(max_depth_raw, str):
+    if max_depth_raw.lower()=="unlimited":
+        max_depth = None
+    else:
+        try:
+            max_depth = int(max_depth_raw)
+        except:
+            max_depth = None
+else:
+    if np.isnan(max_depth_raw):
+        max_depth = None
+    elif max_depth_raw=="unlimited":
+        max_depth = None
+    else:
+        max_depth = int(max_depth_raw)
+
+min_samples_leaf = int(config["min_samples_leaf"])
+threshold = float(config["threshold"])
+
+# same split as Part C
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
+
+params = {"n_estimators": n_estimators, "random_state":42, "min_samples_leaf": min_samples_leaf}
+if max_depth is not None:
+    params["max_depth"] = max_depth
+
+rf = RandomForestClassifier(**params)
+pipe = Pipeline([("selector", SelectKBest(f_classif, k=selector_k)), ("model", rf)])
+pipe.fit(X_train, y_train)
+
+# save
+joblib.dump(pipe, "models/delay_model.pkl")
+pd.DataFrame([{"threshold": threshold}]).to_csv("models/delay_threshold.csv", index=False)
+pd.DataFrame({"feature": FEATURES}).to_csv("models/feature_order.csv", index=False)
+
+# medians from Part A: need to recompute same as Part A: from raw file
+# we stored in part_a_checks but better recompute via clean_shipments None
+from src.shipment_prep import clean_shipments
+import pandas as pd
+raw = pd.read_csv("data/raw_shipments.csv")
+_, medians = clean_shipments(raw, medians=None)
+rows = [{"column": k, "median": v} for k,v in medians.items()]
+pd.DataFrame(rows).to_csv("models/impute_values.csv", index=False)
+
+# reload check
+reloaded = joblib.load("models/delay_model.pkl")
+proba_orig = pipe.predict_proba(X_test)[:,1]
+proba_reload = reloaded.predict_proba(X_test)[:,1]
+max_diff = float(np.max(np.abs(proba_orig - proba_reload)))
+
+check_rows = [
+    ("test_rows_scored", len(X_test)),
+    ("reload_max_abs_probability_diff", max_diff),
+    ("threshold", threshold),
+]
+pd.DataFrame(check_rows, columns=["metric","value"]).to_csv("outputs/part_d_reload_check.csv", index=False)
+print("package done", max_diff)
+print("package done", max_diff)
