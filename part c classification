@@ -1,0 +1,137 @@
+import os, math
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+os.makedirs("outputs", exist_ok=True)
+
+df = pd.read_csv("data/modelling_table.csv")
+from src.shipment_prep import FEATURES
+
+X = df[FEATURES]
+y = df["delivery_hours"]
+
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+scaler = StandardScaler()
+scaler.fit(X_train)
+X_train_scaled = scaler.transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+train_scaled_max_abs_mean = np.abs(X_train_scaled.mean(axis=0)).max()
+test_scaled_max_abs_mean = np.abs(X_test_scaled.mean(axis=0)).max()
+
+checks = [
+    ("train_rows", len(X_train)),
+    ("val_rows", len(X_val)),
+    ("test_rows", len(X_test)),
+    ("train_scaled_max_abs_mean", round(float(train_scaled_max_abs_mean),4)),
+    ("test_scaled_max_abs_mean", round(float(test_scaled_max_abs_mean),4)),
+]
+pd.DataFrame(checks, columns=["metric","value"]).to_csv("outputs/part_b_checks.csv", index=False)
+
+def metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = math.sqrt(mse)
+    r2 = r2_score(y_true, y_pred)
+    return mae, mse, rmse, r2
+
+mean_baseline_pred = np.full_like(y_val, y_train.mean(), dtype=float)
+baseline_metrics = metrics(y_val, mean_baseline_pred)
+
+depths = [1,2,3,4,6,8,12, None]
+tree_rows = []
+best_depth_val = None
+best_rmse = float('inf')
+for d in depths:
+    if d is None:
+        model = DecisionTreeRegressor(random_state=42)
+        label = "unlimited"
+    else:
+        model = DecisionTreeRegressor(max_depth=d, random_state=42)
+        label = d
+    model.fit(X_train, y_train)
+    train_rmse = math.sqrt(mean_squared_error(y_train, model.predict(X_train)))
+    val_rmse = math.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+    tree_rows.append((label, train_rmse, val_rmse))
+    depth_num = 999 if label=="unlimited" else label
+    if val_rmse < best_rmse -1e-9 or (abs(val_rmse-best_rmse)<1e-9 and depth_num < (999 if best_depth_val in [None,"unlimited"] else best_depth_val)):
+        best_rmse = val_rmse
+        best_depth_val = label
+
+if best_depth_val == "unlimited":
+    dt_best = DecisionTreeRegressor(random_state=42)
+else:
+    dt_best = DecisionTreeRegressor(max_depth=best_depth_val, random_state=42)
+
+pd.DataFrame(tree_rows, columns=["max_depth","train_rmse","val_rmse"]).to_csv("outputs/part_b_tree_depth.csv", index=False)
+
+candidates = {}
+lin_pipe = Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])
+lin_pipe.fit(X_train, y_train)
+candidates["linear_regression"] = lin_pipe
+dt_best.fit(X_train, y_train)
+candidates["decision_tree"] = dt_best
+rf = RandomForestRegressor(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+candidates["random_forest"] = rf
+gb = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
+gb.fit(X_train, y_train)
+candidates["gradient_boosting"] = gb
+
+rows = []
+mae,mse,rmse,r2 = baseline_metrics
+rows.append(["mean_baseline","val",mae,mse,rmse,r2])
+for name in ["linear_regression","decision_tree","random_forest","gradient_boosting"]:
+    model = candidates[name]
+    pred = model.predict(X_val)
+    mae,mse,rmse,r2 = metrics(y_val, pred)
+    rows.append([name,"val",mae,mse,rmse,r2])
+
+lr_rows = []
+for lr in [0.01,0.1,1.0]:
+    m = GradientBoostingRegressor(n_estimators=100, learning_rate=lr, random_state=42)
+    m.fit(X_train, y_train)
+    mae,mse,rmse,r2 = metrics(y_val, m.predict(X_val))
+    lr_rows.append([lr, rmse, r2])
+pd.DataFrame(lr_rows, columns=["learning_rate","val_rmse","val_r2"]).to_csv("outputs/part_b_gb_learning_rate.csv", index=False)
+
+val_rmse_map = {r[0]: r[4] for r in rows if r[1]=="val" and r[0]!="mean_baseline"}
+sorted_models = sorted(val_rmse_map.items(), key=lambda x: x[1])
+top2 = [x[0] for x in sorted_models[:2]]
+
+X_trainval = pd.concat([X_train, X_val])
+y_trainval = pd.concat([y_train, y_val])
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_rows = []
+for name in top2:
+    if name == "linear_regression":
+        model = Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])
+    elif name == "decision_tree":
+        if best_depth_val == "unlimited":
+            model = DecisionTreeRegressor(random_state=42)
+        else:
+            model = DecisionTreeRegressor(max_depth=best_depth_val, random_state=42)
+    elif name == "random_forest":
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+    else:
+        model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
+    scores = cross_val_score(model, X_trainval, y_trainval, cv=kf)
+    cv_rows.append([name, scores.mean(), scores.std()])
+
+pd.DataFrame(cv_rows, columns=["model","mean_r2","std_r2"]).to_csv("outputs/part_b_cv.csv", index=False)
+
+final_name = sorted_models[0][0]
+final_model = candidates[final_name]
+pred_test = final_model.predict(X_test)
+mae,mse,rmse,r2 = metrics(y_test, pred_test)
+rows.append([final_name,"test",mae,mse,rmse,r2])
+pd.DataFrame(rows, columns=["model","split","MAE","MSE","RMSE","R2"]).to_csv("outputs/part_b_metrics.csv", index=False)
+print("Part B done", final_name)
