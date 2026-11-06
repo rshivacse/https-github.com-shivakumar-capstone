@@ -1,0 +1,53 @@
+import os
+import pandas as pd
+import joblib
+from src.shipment_prep import clean_shipments, build_features, FEATURES
+
+os.makedirs("outputs", exist_ok=True)
+
+# load models
+model = joblib.load("models/delay_model.pkl")
+threshold_df = pd.read_csv("models/delay_threshold.csv")
+threshold = float(threshold_df["threshold"].iloc[0])
+feature_order = pd.read_csv("models/feature_order.csv")["feature"].tolist()
+medians_df = pd.read_csv("models/impute_values.csv")
+medians = {row["column"]: row["median"] for _, row in medians_df.iterrows()}
+
+hubs = pd.read_csv("data/hubs.csv")
+hub_segments = pd.read_csv("outputs/hub_segments.csv")
+
+raw_new = pd.read_csv("data/new_shipments.csv")
+clean_new, _ = clean_shipments(raw_new, medians=medians)
+feat_new = build_features(clean_new, hubs)
+
+# arrange columns
+X_new = feat_new[feature_order]
+
+proba = model.predict_proba(X_new)[:,1]
+feat_new["delay_probability"] = [round(float(p),4) for p in proba]
+feat_new["flagged"] = (proba >= threshold).astype(int)
+
+# join segment
+feat_new = feat_new.merge(hub_segments[["hub_id","segment"]], on="hub_id", how="left")
+
+def get_action(row):
+    if row["flagged"]==0:
+        return "No action"
+    if row["segment"]=="Escalate":
+        return "Escalate to hub manager"
+    else:
+        return "Proactive customer call"
+
+feat_new["action"] = feat_new.apply(get_action, axis=1)
+
+# file order: order of input file new_shipments.csv
+# raw_new order after clean? We have shipment_id preserve order of raw file after dedup (no dupes). Use merge by shipment_id order.
+# raw_new file order
+order_ids = pd.read_csv("data/new_shipments.csv")["shipment_id"].tolist()
+# create dict for quick lookup and sort
+feat_new["__order"] = feat_new["shipment_id"].apply(lambda x: order_ids.index(x) if x in order_ids else 999)
+feat_new = feat_new.sort_values("__order").drop(columns="__order")
+
+out = feat_new[["shipment_id","hub_id","segment","delay_probability","flagged","action"]]
+out.to_csv("outputs/new_shipment_actions.csv", index=False)
+print(f"scored {len(out)} flagged {(out['flagged']==1).sum()}")
